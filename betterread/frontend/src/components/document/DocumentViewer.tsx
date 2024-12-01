@@ -1,40 +1,59 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Document, Page } from 'react-pdf';
 import { pdfjs } from 'react-pdf';
+import { SelectionTooltip } from './SelectionTooltip';
 import 'react-pdf/dist/esm/Page/AnnotationLayer.css';
 import 'react-pdf/dist/esm/Page/TextLayer.css';
 
-// Initialize pdfjs worker
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.js',
   import.meta.url,
 ).toString();
 
-interface DocumentViewerProps {
-  file: File | null;
-  onSelection?: (selection: string) => void;
+interface Position {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
-export const DocumentViewer: React.FC<DocumentViewerProps> = ({ file, onSelection }) => {
+export interface TextSelection {
+  id: string;
+  text: string;
+  pageNumber: number;
+  position: Position;
+  timestamp: Date;
+}
+
+interface DocumentViewerProps {
+  file: File | null;
+  onSelection?: (selection: TextSelection) => void;
+  onAskAI?: (selection: TextSelection) => void;
+}
+
+export const DocumentViewer: React.FC<DocumentViewerProps> = ({ 
+  file, 
+  onSelection,
+  onAskAI 
+}) => {
   const [numPages, setNumPages] = useState<number>(0);
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [fileUrl, setFileUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selections, setSelections] = useState<TextSelection[]>([]);
+  const [tooltipPosition, setTooltipPosition] = useState<{ x: number; y: number } | null>(null);
+  const [currentSelectionData, setCurrentSelectionData] = useState<TextSelection | null>(null);
 
   useEffect(() => {
     if (file) {
       const url = URL.createObjectURL(file);
       setFileUrl(url);
       setError(null);
-      
-      return () => {
-        URL.revokeObjectURL(url);
-      };
+      return () => URL.revokeObjectURL(url);
     }
   }, [file]);
 
   const handleLoadSuccess = ({ numPages }: { numPages: number }) => {
-    console.log('PDF loaded successfully');
     setNumPages(numPages);
     setError(null);
   };
@@ -44,33 +63,117 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({ file, onSelectio
     setError('Failed to load PDF. Please ensure the file is not corrupted and try again.');
   };
 
-  const handleTextSelection = () => {
-    const selection = window.getSelection();
-    if (selection && selection.toString().length > 0) {
-      onSelection?.(selection.toString());
-    }
-  };
+  const clearTooltip = useCallback(() => {
+    setTooltipPosition(null);
+    setCurrentSelectionData(null);
+  }, []);
 
-  if (error) {
-    return (
-      <div className="w-full max-w-4xl mx-auto p-4 bg-red-50 border border-red-200 rounded-lg">
-        <p className="text-red-600">{error}</p>
-        <button 
-          onClick={() => setError(null)}
-          className="mt-2 text-sm text-blue-500 hover:text-blue-600"
-        >
-          Dismiss
-        </button>
-      </div>
-    );
-  }
+  useEffect(() => {
+    // Add click listener to clear tooltip when clicking outside
+    const handleClickOutside = (e: MouseEvent) => {
+      const tooltip = document.querySelector('[data-tooltip]');
+      if (tooltip && !tooltip.contains(e.target as Node)) {
+        clearTooltip();
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [clearTooltip]);
+
+  const handleTextSelection = useCallback(() => {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed) {
+      return;
+    }
+
+    const selectedText = selection.toString().trim();
+    if (!selectedText) {
+      clearTooltip();
+      return;
+    }
+
+    const range = selection.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+
+    // Get the PDF container element
+    const pdfContainer = document.querySelector('.react-pdf__Page');
+    if (!pdfContainer) return;
+
+    const containerRect = pdfContainer.getBoundingClientRect();
+
+    // Calculate position relative to PDF container
+    const position: Position = {
+      x: rect.left - containerRect.left,
+      y: rect.top - containerRect.top,
+      width: rect.width,
+      height: rect.height
+    };
+
+    const selectionData: TextSelection = {
+      id: crypto.randomUUID(),
+      text: selectedText,
+      pageNumber: currentPage,
+      position,
+      timestamp: new Date()
+    };
+
+    setCurrentSelectionData(selectionData);
+    setTooltipPosition({
+      x: rect.left + (rect.width / 2),
+      y: rect.top
+    });
+  }, [currentPage, clearTooltip]);
+
+  const highlightSelection = useCallback((selection: TextSelection) => {
+    const highlight = document.createElement('div');
+    highlight.className = 'absolute bg-yellow-200 opacity-50 pointer-events-none';
+    highlight.style.left = `${selection.position.x}px`;
+    highlight.style.top = `${selection.position.y}px`;
+    highlight.style.width = `${selection.position.width}px`;
+    highlight.style.height = `${selection.position.height}px`;
+    highlight.setAttribute('data-selection-id', selection.id);
+
+    const container = document.querySelector('.react-pdf__Page');
+    if (container) {
+      container.appendChild(highlight);
+    }
+  }, []);
+
+  const handleHighlight = useCallback(() => {
+    if (currentSelectionData) {
+      setSelections(prev => [...prev, currentSelectionData]);
+      highlightSelection(currentSelectionData);
+      onSelection?.(currentSelectionData);
+      clearTooltip();
+    }
+  }, [currentSelectionData, highlightSelection, onSelection, clearTooltip]);
+
+  const handleAskAI = useCallback(() => {
+    if (currentSelectionData) {
+      onAskAI?.(currentSelectionData);
+      clearTooltip();
+    }
+  }, [currentSelectionData, onAskAI, clearTooltip]);
+
+  // Re-render highlights when page changes
+  useEffect(() => {
+    // Clear existing highlights
+    const highlights = document.querySelectorAll('[data-selection-id]');
+    highlights.forEach(highlight => highlight.remove());
+
+    // Render highlights for current page
+    selections
+      .filter(selection => selection.pageNumber === currentPage)
+      .forEach(highlightSelection);
+  }, [currentPage, selections, highlightSelection]);
 
   return (
     <div className="flex flex-col items-center w-full max-w-4xl mx-auto">
       {fileUrl && (
         <>
           <div 
-            className="w-full bg-white shadow-lg rounded-lg overflow-hidden"
+            className="w-full bg-white shadow-lg rounded-lg overflow-hidden relative"
             onMouseUp={handleTextSelection}
           >
             <Document
@@ -92,14 +195,18 @@ export const DocumentViewer: React.FC<DocumentViewerProps> = ({ file, onSelectio
                     <div className="animate-pulse text-gray-600">Loading page...</div>
                   </div>
                 }
-                error={
-                  <div className="text-center p-4 text-red-500">
-                    Error loading page. Please try again.
-                  </div>
-                }
               />
             </Document>
           </div>
+          
+          {tooltipPosition && (
+            <SelectionTooltip
+              position={tooltipPosition}
+              onHighlight={handleHighlight}
+              onAskAI={handleAskAI}
+              onClose={clearTooltip}
+            />
+          )}
           
           {numPages > 0 && (
             <div className="flex items-center gap-4 mt-4 p-2">
